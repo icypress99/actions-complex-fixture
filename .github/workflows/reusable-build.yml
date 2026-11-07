@@ -1,0 +1,45 @@
+name: Reusable Build
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version
+        type: string
+        required: false
+        default: "20"
+      artifact-name:
+        description: Upload artifact name
+        type: string
+        required: false
+        default: reusable-dist
+    outputs:
+      build-sha:
+        description: Short SHA baked into the build
+        value: ${{ jobs.package.outputs.build-sha }}
+
+jobs:
+  package:
+    name: Package (reusable)
+    runs-on: ubuntu-latest
+    outputs:
+      build-sha: ${{ steps.meta.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build
+        run: npm run build
+
+      - name: Meta
+        id: meta
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist/
+          retention-days: 3

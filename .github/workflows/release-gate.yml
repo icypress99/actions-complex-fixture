@@ -1,0 +1,71 @@
+name: Release Gate
+
+# Manual only — no static IP / self-hosted / inbound webhook required.
+# Approve & run from the Actions tab (workflow_dispatch).
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options:
+          - canary
+          - stable
+        default: canary
+      dry_run:
+        description: Skip the final publish step
+        type: boolean
+        default: true
+
+jobs:
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.out.outputs.channel }}
+    steps:
+      - id: out
+        run: |
+          echo "channel=${{ inputs.channel }}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build candidate
+    needs: validate
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      node-version: "20"
+      artifact-name: release-${{ needs.validate.outputs.channel }}-dist
+
+  smoke:
+    name: Smoke downloaded artifact
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.validate.outputs.channel }}-dist
+          path: dist
+      - name: Inspect
+        run: |
+          test -f dist/build-info.json
+          cat dist/build-info.json
+
+  publish:
+    name: Publish (simulated)
+    needs: [validate, smoke]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run == false }}
+    steps:
+      - name: Fake publish
+        run: |
+          echo "Would publish channel=${{ needs.validate.outputs.channel }}"
+          echo "No external IP / private runner required — this is a no-op log."
+
+  dry-run-note:
+    name: Dry-run note
+    needs: [validate, smoke]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run == true }}
+    steps:
+      - run: echo "Dry-run complete for channel=${{ needs.validate.outputs.channel }}"

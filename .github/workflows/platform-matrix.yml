@@ -1,0 +1,56 @@
+name: Platform Matrix
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "package.json"
+      - ".github/workflows/platform-matrix.yml"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: platform-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe OS
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ["18", "20", "22"]
+        exclude:
+          # Keep macOS cheaper — skip Node 18 on mac
+          - os: macos-latest
+            node: "18"
+        include:
+          - os: ubuntu-latest
+            node: "20"
+            extra: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Unit tests
+        run: npm test
+      - name: Extra ubuntu marker
+        if: matrix.extra == true
+        run: echo "extra ubuntu+node20 lane"
+
+  summarize:
+    name: Summarize platforms
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        run: |
+          echo "probe result=${{ needs.probe.result }}"
+          if [ "${{ needs.probe.result }}" != "success" ]; then
+            echo "::warning::One or more matrix legs failed (fail-fast is off)"
+          fi

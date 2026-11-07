@@ -1,0 +1,263 @@
+name: Complex CI
+
+# Dense job DAG for Workflow Studio — GitHub-hosted runners only.
+# No self-hosted labels, no IP allowlists, no callbacks to your LAN.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_windows:
+        description: Skip the Windows leg
+        type: boolean
+        default: false
+      enable_slow_path:
+        description: Enable optional slow analysis branch
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: complex-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FIXTURE_NAME: actions-complex-fixture
+
+jobs:
+  # ── Stage 0: bootstrap ────────────────────────────────────────────────────
+  changelog:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.flags.outputs.should_build }}
+      has_src: ${{ steps.flags.outputs.has_src }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Flags
+        id: flags
+        shell: bash
+        run: |
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            if git diff --name-only HEAD^ HEAD | grep -qE '^(src|scripts|package.json)'; then
+              echo "has_src=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_src=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "has_src=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  prepare:
+    name: Prepare workspace
+    needs: changelog
+    if: needs.changelog.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/hello-composite
+        with:
+          message: prepare-${{ env.FIXTURE_NAME }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Cache npm hint
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+      - name: Sanity
+        run: node -v && npm -v
+
+  # ── Stage 1: parallel quality gates ───────────────────────────────────────
+  lint:
+    name: Lint
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm run lint
+
+  unit-linux:
+    name: Unit (Linux)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+
+  unit-windows:
+    name: Unit (Windows)
+    needs: prepare
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_windows == false }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+
+  unit-macos:
+    name: Unit (macOS)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+
+  security-hints:
+    name: Security hints
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Naive secret scan
+        run: |
+          if grep -RInE '(AKIA[0-9A-Z]{16}|BEGIN RSA PRIVATE KEY)' src scripts || true; then
+            echo "scan finished"
+          fi
+
+  # ── Stage 2: matrix build fan-out ─────────────────────────────────────────
+  build-matrix:
+    name: Build matrix
+    needs: [lint, unit-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "22"]
+        include:
+          - node: "20"
+            publishable: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-node-${{ matrix.node }}
+          path: dist/
+          retention-days: 2
+      - name: Mark publishable
+        if: matrix.publishable
+        run: echo "node20 lane is publishable"
+
+  # Reusable workflow call (shows up as a nested/linked workflow in GH UI)
+  package-call:
+    name: Package via reusable
+    needs: [lint, unit-linux]
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      node-version: "20"
+      artifact-name: complex-reusable-dist
+
+  # ── Stage 3: optional slow path ───────────────────────────────────────────
+  slow-analysis:
+    name: Slow analysis
+    needs: [unit-linux, security-hints]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_slow_path == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pretend heavy analysis
+        run: |
+          for i in 1 2 3; do
+            echo "analysis tick $i"
+            sleep 1
+          done
+
+  # ── Stage 4: fan-in integration ───────────────────────────────────────────
+  integration:
+    name: Integration
+    needs:
+      - build-matrix
+      - package-call
+      - unit-windows
+      - unit-macos
+    # Continue even if optional Windows was skipped
+    if: |
+      always() &&
+      needs.build-matrix.result == 'success' &&
+      needs.package-call.result == 'success' &&
+      (needs.unit-windows.result == 'success' || needs.unit-windows.result == 'skipped') &&
+      needs.unit-macos.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-node-20
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm run integration
+
+  contract-tests:
+    name: Contract tests
+    needs: [integration, slow-analysis]
+    if: |
+      always() &&
+      needs.integration.result == 'success' &&
+      (needs.slow-analysis.result == 'success' || needs.slow-analysis.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: complex-reusable-dist
+          path: reusable-dist
+      - name: Compare build metadata
+        run: |
+          test -f reusable-dist/build-info.json
+          node -e "const j=require('./reusable-dist/build-info.json'); if(!j.sha) process.exit(1); console.log('contract ok', j.sha)"
+
+  # ── Stage 5: final gates ──────────────────────────────────────────────────
+  notify-success:
+    name: Notify success
+    needs: [contract-tests, changelog]
+    if: needs.contract-tests.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Green path
+        run: |
+          echo "Complex CI green for ${{ github.sha }}"
+          echo "has_src=${{ needs.changelog.outputs.has_src }}"
+
+  notify-failure:
+    name: Notify failure
+    needs: [contract-tests, integration, build-matrix]
+    if: |
+      always() &&
+      (needs.contract-tests.result == 'failure' ||
+       needs.integration.result == 'failure' ||
+       needs.build-matrix.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Red path
+        run: |
+          echo "::error::Complex CI failed"
+          echo "contract=${{ needs.contract-tests.result }}"
+          echo "integration=${{ needs.integration.result }}"
+          echo "build-matrix=${{ needs.build-matrix.result }}"
+          exit 1
